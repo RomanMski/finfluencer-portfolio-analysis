@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Raw transcript data
+data/transcripts/*.json
+data/transcripts/*.txt
+data/transcripts/*.zip
+
+# Large/regen data
+data/market/*.csv
+
+# Optional: keep generated outputs out until cleaned
+# outputs/figures/*.png

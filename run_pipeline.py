@@ -1,0 +1,550 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import zipfile
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from src.ticker_universe import TICKERS
+
+
+def run_cmd(cmd: list[str], cwd: Path | None = None) -> str:
+    proc = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Command failed:\n{' '.join(cmd)}\n\nSTDERR:\n{proc.stderr[:4000]}"
+        )
+    return proc.stdout
+
+
+def get_video_inventory(channel_url: str, max_videos: int, out_csv: Path) -> pd.DataFrame:
+    """
+    Uses yt-dlp in flat-playlist mode to collect video metadata without downloading videos.
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--flat-playlist",
+        "--dump-json",
+        "--playlist-end",
+        str(max_videos),
+        channel_url,
+    ]
+    raw = run_cmd(cmd)
+    rows = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        video_id = item.get("id")
+        if not video_id:
+            continue
+
+        upload_date = item.get("upload_date")
+        if upload_date and re.fullmatch(r"\d{8}", str(upload_date)):
+            date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+        else:
+            date = item.get("timestamp")
+            if date:
+                date = datetime.utcfromtimestamp(date).strftime("%Y-%m-%d")
+            else:
+                date = ""
+
+        rows.append(
+            {
+                "video_id": video_id,
+                "date": date,
+                "title": item.get("title", ""),
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "duration": item.get("duration", ""),
+                "view_count": item.get("view_count", ""),
+                "channel": item.get("channel", ""),
+            }
+        )
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=["video_id"])
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    return df
+
+
+def fetch_transcript_segments(video_id: str) -> list[dict[str, Any]]:
+    """
+    Tries to fetch an English transcript using youtube-transcript-api.
+    Supports both older and newer versions of the package.
+    """
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    langs_try = ["en", "en-US", "en-GB"]
+
+    # Older API
+    if hasattr(YouTubeTranscriptApi, "get_transcript"):
+        try:
+            return YouTubeTranscriptApi.get_transcript(video_id, languages=langs_try)
+        except Exception:
+            pass
+
+    # Newer API object style
+    try:
+        api = YouTubeTranscriptApi()
+        fetched = api.fetch(video_id, languages=langs_try)
+        segments = []
+        for s in fetched:
+            # FetchedTranscriptSnippet may expose attributes rather than dict keys
+            if isinstance(s, dict):
+                segments.append(s)
+            else:
+                segments.append(
+                    {
+                        "text": getattr(s, "text", ""),
+                        "start": getattr(s, "start", 0.0),
+                        "duration": getattr(s, "duration", 0.0),
+                    }
+                )
+        return segments
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+
+def seconds_to_hhmmss(seconds: float | int) -> str:
+    seconds = int(max(0, float(seconds)))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def clean_text(s: str) -> str:
+    s = re.sub(r"\s+", " ", str(s)).strip()
+    return s
+
+
+def save_transcripts(inventory: pd.DataFrame, transcript_dir: Path) -> pd.DataFrame:
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    status_rows = []
+
+    for _, row in tqdm(inventory.iterrows(), total=len(inventory), desc="Downloading transcripts"):
+        video_id = row["video_id"]
+        json_path = transcript_dir / f"{video_id}.json"
+        txt_path = transcript_dir / f"{video_id}.txt"
+
+        if json_path.exists() and txt_path.exists():
+            status_rows.append(
+                {
+                    "video_id": video_id,
+                    "transcript_status": "already_exists",
+                    "segments": "",
+                    "error": "",
+                }
+            )
+            continue
+
+        try:
+            segments = fetch_transcript_segments(video_id)
+            enriched = []
+            for seg in segments:
+                start = float(seg.get("start", 0.0))
+                dur = float(seg.get("duration", 0.0))
+                enriched.append(
+                    {
+                        "video_id": video_id,
+                        "video_title": row.get("title", ""),
+                        "video_date": row.get("date", ""),
+                        "video_url": row.get("url", ""),
+                        "start": start,
+                        "end": start + dur,
+                        "timestamp": seconds_to_hhmmss(start),
+                        "timestamp_url": f"https://www.youtube.com/watch?v={video_id}&t={int(start)}s",
+                        "text": clean_text(seg.get("text", "")),
+                    }
+                )
+
+            with json_path.open("w", encoding="utf-8") as f:
+                json.dump(enriched, f, ensure_ascii=False, indent=2)
+
+            with txt_path.open("w", encoding="utf-8") as f:
+                f.write(f"TITLE: {row.get('title', '')}\n")
+                f.write(f"DATE: {row.get('date', '')}\n")
+                f.write(f"URL: {row.get('url', '')}\n\n")
+                for seg in enriched:
+                    f.write(f"[{seg['timestamp']}] {seg['text']}\n")
+
+            status_rows.append(
+                {
+                    "video_id": video_id,
+                    "transcript_status": "ok",
+                    "segments": len(enriched),
+                    "error": "",
+                }
+            )
+        except Exception as e:
+            status_rows.append(
+                {
+                    "video_id": video_id,
+                    "transcript_status": "failed",
+                    "segments": 0,
+                    "error": str(e)[:500],
+                }
+            )
+
+    return pd.DataFrame(status_rows)
+
+
+def zip_transcripts(transcript_dir: Path, out_zip: Path) -> None:
+    out_zip.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for path in sorted(transcript_dir.glob("*")):
+            if path.suffix.lower() in {".txt", ".json"}:
+                z.write(path, arcname=path.name)
+
+
+def compile_patterns() -> list[tuple[str, str, list[re.Pattern]]]:
+    """
+    Returns (ticker, company, patterns).
+    Patterns include ticker and company aliases, but avoid too many ambiguous tickers.
+    """
+    compiled = []
+    for ticker, company, aliases in TICKERS:
+        pats = []
+        # Ticker match: requires common stock-style context or cashtag to reduce false positives.
+        # We still allow bare uppercase tickers for low-ambiguity symbols.
+        if len(ticker) >= 3:
+            pats.append(re.compile(rf"(?<![A-Za-z0-9])\$?{re.escape(ticker)}(?![A-Za-z0-9])"))
+        else:
+            pats.append(re.compile(rf"(?<![A-Za-z0-9])\${re.escape(ticker)}(?![A-Za-z0-9])"))
+        for alias in aliases + [company]:
+            if alias:
+                pats.append(re.compile(rf"\b{re.escape(alias)}\b", flags=re.IGNORECASE))
+        compiled.append((ticker, company, pats))
+    return compiled
+
+
+BUY_PATTERNS = [
+    r"\b(buy|buying|bought|purchase|purchasing|add|adding|added|accumulate|building.*position|start.*position|opened.*position|initiate|initiated)\b",
+    r"\b(stocks? to buy|best stocks?|top stocks?|undervalued|cheap|attractive valuation|strong buy)\b",
+]
+SELL_PATTERNS = [
+    r"\b(sell|selling|sold|trim|trimming|trimmed|reduce|reducing|reduced|exit|exited|close.*position|closed.*position)\b",
+]
+HOLD_PATTERNS = [
+    r"\b(hold|holding|holdings|own|owned|still own|portfolio|position|largest position|allocation|weight|dividend income)\b",
+]
+WATCH_PATTERNS = [
+    r"\b(watchlist|watching|looking at|considering|maybe|could buy|might buy|interested in)\b",
+]
+NEGATION_PATTERNS = [
+    r"\b(not buying|wouldn't buy|would not buy|don't buy|do not buy|avoid|too expensive|overvalued|not interested)\b",
+]
+
+
+def infer_action(context: str) -> tuple[str, float]:
+    ctx = context.lower()
+
+    def score(patterns: list[str]) -> int:
+        return sum(1 for p in patterns if re.search(p, ctx, flags=re.IGNORECASE))
+
+    neg = score(NEGATION_PATTERNS)
+    buy = score(BUY_PATTERNS)
+    sell = score(SELL_PATTERNS)
+    hold = score(HOLD_PATTERNS)
+    watch = score(WATCH_PATTERNS)
+
+    if neg and buy:
+        return "negative_or_not_buying", 0.65
+    if sell:
+        return "sell_or_reduce", min(0.95, 0.65 + 0.1 * sell)
+    if buy:
+        return "buy_or_add", min(0.95, 0.65 + 0.1 * buy)
+    if hold:
+        return "hold_or_portfolio_holding", min(0.90, 0.55 + 0.1 * hold)
+    if watch:
+        return "watchlist_or_uncertain", 0.45
+    return "mention_only", 0.25
+
+
+def build_context(segments: list[dict[str, Any]], idx: int, window: int = 2) -> tuple[str, float, float]:
+    lo = max(0, idx - window)
+    hi = min(len(segments), idx + window + 1)
+    context = " ".join(clean_text(s.get("text", "")) for s in segments[lo:hi])
+    start = float(segments[lo].get("start", 0.0))
+    end = float(segments[hi - 1].get("end", segments[hi - 1].get("start", 0.0)))
+    return clean_text(context), start, end
+
+
+def extract_candidates(transcript_dir: Path) -> pd.DataFrame:
+    patterns = compile_patterns()
+    rows = []
+
+    for json_path in sorted(transcript_dir.glob("*.json")):
+        with json_path.open("r", encoding="utf-8") as f:
+            segments = json.load(f)
+
+        if not segments:
+            continue
+
+        for i, seg in enumerate(segments):
+            text = clean_text(seg.get("text", ""))
+            if not text:
+                continue
+
+            matched = []
+            for ticker, company, pats in patterns:
+                if any(p.search(text) for p in pats):
+                    matched.append((ticker, company))
+
+            if not matched:
+                continue
+
+            context, start, end = build_context(segments, i, window=2)
+            action, conf = infer_action(context)
+            video_id = seg.get("video_id", "")
+
+            for ticker, company in matched:
+                rows.append(
+                    {
+                        "video_date": seg.get("video_date", ""),
+                        "video_title": seg.get("video_title", ""),
+                        "video_url": seg.get("video_url", f"https://www.youtube.com/watch?v={video_id}"),
+                        "timestamp_start_seconds": int(start),
+                        "timestamp_end_seconds": int(end),
+                        "timestamp_start": seconds_to_hhmmss(start),
+                        "timestamp_end": seconds_to_hhmmss(end),
+                        "timestamp_url": f"https://www.youtube.com/watch?v={video_id}&t={int(start)}s",
+                        "ticker": ticker,
+                        "company": company,
+                        "action_inferred": action,
+                        "confidence_rule_based": round(conf, 3),
+                        "quote_segment": text,
+                        "context_window": context,
+                        "manual_review": "yes" if conf < 0.75 or action in {"mention_only", "watchlist_or_uncertain", "negative_or_not_buying"} else "spot_check",
+                        "verified_action": "",
+                        "include_in_portfolio": "",
+                        "notes": "",
+                    }
+                )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # De-duplicate overlapping repeated mentions of same ticker within the same minute/video.
+    df["minute_bucket"] = (df["timestamp_start_seconds"] // 60).astype(int)
+    df = df.sort_values(["video_date", "video_title", "timestamp_start_seconds", "ticker"])
+    df = df.drop_duplicates(subset=["video_url", "ticker", "minute_bucket", "action_inferred"])
+    df = df.drop(columns=["minute_bucket"])
+
+    return df
+
+
+def make_review_template(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    keep = [
+        "video_date",
+        "video_title",
+        "timestamp_url",
+        "ticker",
+        "company",
+        "action_inferred",
+        "confidence_rule_based",
+        "quote_segment",
+        "context_window",
+        "manual_review",
+        "verified_action",
+        "include_in_portfolio",
+        "notes",
+    ]
+    return df[keep].copy()
+
+
+def create_charts(df: pd.DataFrame, charts_dir: Path) -> None:
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    if df.empty:
+        return
+
+    plot_df = df.copy()
+    plot_df["video_date"] = pd.to_datetime(plot_df["video_date"], errors="coerce")
+
+    top = plot_df["ticker"].value_counts().head(15).sort_values()
+    if not top.empty:
+        plt.figure(figsize=(9, 6))
+        top.plot(kind="barh")
+        plt.title("Top detected tickers in transcripts")
+        plt.xlabel("Detected candidate mentions")
+        plt.tight_layout()
+        plt.savefig(charts_dir / "picks_by_ticker.png", dpi=180)
+        plt.close()
+
+    actions = plot_df["action_inferred"].value_counts().sort_values()
+    if not actions.empty:
+        plt.figure(figsize=(9, 5))
+        actions.plot(kind="barh")
+        plt.title("Candidate actions inferred from transcript context")
+        plt.xlabel("Rows")
+        plt.tight_layout()
+        plt.savefig(charts_dir / "actions_distribution.png", dpi=180)
+        plt.close()
+
+    by_month = (
+        plot_df.dropna(subset=["video_date"])
+        .assign(month=lambda x: x["video_date"].dt.to_period("M").astype(str))
+        .groupby("month")
+        .size()
+    )
+    if not by_month.empty:
+        plt.figure(figsize=(10, 5))
+        by_month.plot(kind="line", marker="o")
+        plt.title("Detected candidate stock-pick rows over time")
+        plt.xlabel("Month")
+        plt.ylabel("Candidate rows")
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+        plt.savefig(charts_dir / "picks_over_time.png", dpi=180)
+        plt.close()
+
+
+def write_summary(inventory: pd.DataFrame, status: pd.DataFrame, candidates: pd.DataFrame, out_path: Path) -> None:
+    ok = int((status["transcript_status"].isin(["ok", "already_exists"])).sum()) if not status.empty else 0
+    failed = int((status["transcript_status"] == "failed").sum()) if not status.empty else 0
+
+    if candidates.empty:
+        top_tickers = "No candidates found."
+        action_counts = "No candidates found."
+    else:
+        top_tickers = candidates["ticker"].value_counts().head(10).to_string()
+        action_counts = candidates["action_inferred"].value_counts().to_string()
+
+    text = f"""# Pipeline summary
+
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Video collection
+
+- Videos in inventory: {len(inventory)}
+- Transcripts downloaded/existing: {ok}
+- Transcript failures: {failed}
+
+## Candidate extraction
+
+- Candidate rows: {0 if candidates.empty else len(candidates)}
+- Unique tickers: {0 if candidates.empty else candidates['ticker'].nunique()}
+
+### Top tickers
+
+```text
+{top_tickers}
+```
+
+### Inferred action counts
+
+```text
+{action_counts}
+```
+
+## Interpretation warning
+
+The CSV is a candidate extraction table, not the final portfolio yet. For the report, manually verify the rows that become portfolio entries/exits. The strongest evidence is a direct portfolio screenshot/update or explicit language such as "I bought", "I sold", "I added", "this is my current holding", or an explicit allocation/weight.
+
+Suggested next step:
+
+1. Open `data/processed/stock_pick_candidates_review_template.csv`.
+2. Filter for `buy_or_add`, `sell_or_reduce`, and `hold_or_portfolio_holding`.
+3. Watch/check the timestamp URLs.
+4. Fill `verified_action` and `include_in_portfolio`.
+5. Convert verified rows into the portfolio timeline.
+"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--channel", default="https://www.youtube.com/@JosephCarlsonShow/videos")
+    ap.add_argument("--max-videos", type=int, default=80)
+    ap.add_argument("--skip-download", action="store_true", help="Use existing data/video_inventory.csv and transcripts.")
+    args = ap.parse_args()
+
+    root = Path(__file__).resolve().parent
+    data_dir = root / "data"
+    transcript_dir = data_dir / "transcripts"
+    processed_dir = data_dir / "processed"
+    charts_dir = root / "outputs" / "charts"
+
+    inventory_csv = data_dir / "video_inventory.csv"
+    transcript_status_csv = data_dir / "transcript_status.csv"
+    transcript_zip = transcript_dir / "transcripts_bundle.zip"
+    candidates_csv = processed_dir / "stock_pick_candidates.csv"
+    review_csv = processed_dir / "stock_pick_candidates_review_template.csv"
+    summary_md = root / "outputs" / "summary_report.md"
+
+    if args.skip_download and inventory_csv.exists():
+        inventory = pd.read_csv(inventory_csv)
+    else:
+        print("Collecting video inventory...")
+        inventory = get_video_inventory(args.channel, args.max_videos, inventory_csv)
+
+    if args.skip_download and transcript_status_csv.exists():
+        status = pd.read_csv(transcript_status_csv)
+    else:
+        status = save_transcripts(inventory, transcript_dir)
+        status.to_csv(transcript_status_csv, index=False)
+
+    print("Bundling transcripts...")
+    zip_transcripts(transcript_dir, transcript_zip)
+
+    print("Extracting candidate stock picks / portfolio updates...")
+    candidates = extract_candidates(transcript_dir)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    candidates.to_csv(candidates_csv, index=False)
+
+    review = make_review_template(candidates)
+    review.to_csv(review_csv, index=False)
+
+    print("Creating charts...")
+    create_charts(candidates, charts_dir)
+
+    print("Writing summary...")
+    write_summary(inventory, status, candidates, summary_md)
+
+    print("\nDONE")
+    print(f"Inventory:      {inventory_csv}")
+    print(f"Transcript zip: {transcript_zip}")
+    print(f"Candidates:     {candidates_csv}")
+    print(f"Review file:    {review_csv}")
+    print(f"Charts:         {charts_dir}")
+    print(f"Summary:        {summary_md}")
+
+
+if __name__ == "__main__":
+    main()
