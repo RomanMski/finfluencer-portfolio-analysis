@@ -1,26 +1,47 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-import math
 import re
-import shutil
 import subprocess
 import sys
-import textwrap
+import time
 import zipfile
-from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 
 from src.ticker_universe import TICKERS
+from src.transcripts import classify_transcript_error, fetch_transcript_segments
+
+
+CANDIDATE_COLUMNS = [
+    "video_id",
+    "video_date",
+    "video_title",
+    "video_url",
+    "timestamp_seconds",
+    "timestamp_start_seconds",
+    "timestamp_end_seconds",
+    "timestamp_start",
+    "timestamp_end",
+    "timestamp_url",
+    "ticker",
+    "company",
+    "action_inferred",
+    "event_type",
+    "confidence_rule_based",
+    "source_method",
+    "quote_segment",
+    "context_window",
+    "manual_review",
+    "verified_action",
+    "include_in_portfolio",
+    "notes",
+]
 
 
 def run_cmd(cmd: list[str], cwd: Path | None = None) -> str:
@@ -97,44 +118,6 @@ def get_video_inventory(channel_url: str, max_videos: int, out_csv: Path) -> pd.
     return df
 
 
-def fetch_transcript_segments(video_id: str) -> list[dict[str, Any]]:
-    """
-    Tries to fetch an English transcript using youtube-transcript-api.
-    Supports both older and newer versions of the package.
-    """
-    from youtube_transcript_api import YouTubeTranscriptApi
-
-    langs_try = ["en", "en-US", "en-GB"]
-
-    # Older API
-    if hasattr(YouTubeTranscriptApi, "get_transcript"):
-        try:
-            return YouTubeTranscriptApi.get_transcript(video_id, languages=langs_try)
-        except Exception:
-            pass
-
-    # Newer API object style
-    try:
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id, languages=langs_try)
-        segments = []
-        for s in fetched:
-            # FetchedTranscriptSnippet may expose attributes rather than dict keys
-            if isinstance(s, dict):
-                segments.append(s)
-            else:
-                segments.append(
-                    {
-                        "text": getattr(s, "text", ""),
-                        "start": getattr(s, "start", 0.0),
-                        "duration": getattr(s, "duration", 0.0),
-                    }
-                )
-        return segments
-    except Exception as e:
-        raise RuntimeError(str(e))
-
-
 def seconds_to_hhmmss(seconds: float | int) -> str:
     seconds = int(max(0, float(seconds)))
     h = seconds // 3600
@@ -150,11 +133,19 @@ def clean_text(s: str) -> str:
     return s
 
 
-def save_transcripts(inventory: pd.DataFrame, transcript_dir: Path) -> pd.DataFrame:
+def save_transcripts(
+    inventory: pd.DataFrame,
+    transcript_dir: Path,
+    cookies_from_browser: str | None = None,
+    request_delay: float = 0.75,
+) -> pd.DataFrame:
     transcript_dir.mkdir(parents=True, exist_ok=True)
     status_rows = []
+    started = time.monotonic()
+    total = len(inventory)
+    consecutive_ip_blocks = 0
 
-    for _, row in tqdm(inventory.iterrows(), total=len(inventory), desc="Downloading transcripts"):
+    for number, (_, row) in enumerate(inventory.iterrows(), start=1):
         video_id = row["video_id"]
         json_path = transcript_dir / f"{video_id}.json"
         txt_path = transcript_dir / f"{video_id}.txt"
@@ -165,58 +156,93 @@ def save_transcripts(inventory: pd.DataFrame, transcript_dir: Path) -> pd.DataFr
                     "video_id": video_id,
                     "transcript_status": "already_exists",
                     "segments": "",
+                    "source_method": "saved_file",
+                    "error_type": "",
                     "error": "",
                 }
             )
-            continue
-
-        try:
-            segments = fetch_transcript_segments(video_id)
-            enriched = []
-            for seg in segments:
-                start = float(seg.get("start", 0.0))
-                dur = float(seg.get("duration", 0.0))
-                enriched.append(
-                    {
-                        "video_id": video_id,
-                        "video_title": row.get("title", ""),
-                        "video_date": row.get("date", ""),
-                        "video_url": row.get("url", ""),
-                        "start": start,
-                        "end": start + dur,
-                        "timestamp": seconds_to_hhmmss(start),
-                        "timestamp_url": f"https://www.youtube.com/watch?v={video_id}&t={int(start)}s",
-                        "text": clean_text(seg.get("text", "")),
-                    }
-                )
-
-            with json_path.open("w", encoding="utf-8") as f:
-                json.dump(enriched, f, ensure_ascii=False, indent=2)
-
-            with txt_path.open("w", encoding="utf-8") as f:
-                f.write(f"TITLE: {row.get('title', '')}\n")
-                f.write(f"DATE: {row.get('date', '')}\n")
-                f.write(f"URL: {row.get('url', '')}\n\n")
-                for seg in enriched:
-                    f.write(f"[{seg['timestamp']}] {seg['text']}\n")
-
-            status_rows.append(
-                {
-                    "video_id": video_id,
-                    "transcript_status": "ok",
-                    "segments": len(enriched),
-                    "error": "",
-                }
-            )
-        except Exception as e:
+            consecutive_ip_blocks = 0
+        elif consecutive_ip_blocks >= 3 and not cookies_from_browser:
             status_rows.append(
                 {
                     "video_id": video_id,
                     "transcript_status": "failed",
                     "segments": 0,
-                    "error": str(e)[:500],
+                    "source_method": "",
+                    "error_type": "ip_blocked",
+                    "error": "Skipped after three consecutive YouTube IP blocks in this run.",
                 }
             )
+        else:
+            try:
+                segments, source_method = fetch_transcript_segments(
+                    video_id,
+                    cookies_from_browser=cookies_from_browser,
+                )
+                enriched = []
+                for seg in segments:
+                    start = float(seg.get("start", 0.0))
+                    duration = float(seg.get("duration", 0.0))
+                    enriched.append(
+                        {
+                            "video_id": video_id,
+                            "video_title": row.get("title", ""),
+                            "video_date": row.get("date", ""),
+                            "video_url": row.get("url", ""),
+                            "start": start,
+                            "end": start + duration,
+                            "timestamp": seconds_to_hhmmss(start),
+                            "timestamp_url": f"https://www.youtube.com/watch?v={video_id}&t={int(start)}s",
+                            "source_method": source_method,
+                            "text": clean_text(seg.get("text", "")),
+                        }
+                    )
+
+                with json_path.open("w", encoding="utf-8") as f:
+                    json.dump(enriched, f, ensure_ascii=False, indent=2)
+
+                with txt_path.open("w", encoding="utf-8") as f:
+                    f.write(f"TITLE: {row.get('title', '')}\n")
+                    f.write(f"DATE: {row.get('date', '')}\n")
+                    f.write(f"URL: {row.get('url', '')}\n\n")
+                    for seg in enriched:
+                        f.write(f"[{seg['timestamp']}] {seg['text']}\n")
+
+                status_rows.append(
+                    {
+                        "video_id": video_id,
+                        "transcript_status": "ok",
+                        "segments": len(enriched),
+                        "source_method": source_method,
+                        "error_type": "",
+                        "error": "",
+                    }
+                )
+                consecutive_ip_blocks = 0
+            except Exception as exc:
+                error = str(exc)
+                error_type = classify_transcript_error(error)
+                status_rows.append(
+                    {
+                        "video_id": video_id,
+                        "transcript_status": "failed",
+                        "segments": 0,
+                        "source_method": "",
+                        "error_type": error_type,
+                        "error": error[:1000],
+                    }
+                )
+                consecutive_ip_blocks = consecutive_ip_blocks + 1 if error_type == "ip_blocked" else 0
+
+        elapsed = max(time.monotonic() - started, 0.001)
+        rate = number / elapsed
+        eta = int((total - number) / rate) if rate else 0
+        print(
+            f"PROGRESS transcripts {number} {total} elapsed={int(elapsed)} eta={eta}",
+            flush=True,
+        )
+        if number < total and request_delay > 0 and consecutive_ip_blocks < 3:
+            time.sleep(request_delay)
 
     return pd.DataFrame(status_rows)
 
@@ -268,6 +294,34 @@ NEGATION_PATTERNS = [
 ]
 
 
+BUY_PATTERNS.extend([
+    r"\b(long|long setup|long entry|entry zone|accumulation zone|support buy|breakout buy|buy zone|adding zone)\b",
+    r"\b(kaufen|kaufe|kauft|gekauft|nachkaufen|aufstocken|einstieg|einsteigen|eingestiegen|kaufzone|einstiegsbereich|akkumulieren)\b",
+    r"\b(achat|acheter|acheté|acheterais|zone d'achat|entrée|position longue)\b",
+])
+SELL_PATTERNS.extend([
+    r"\b(short|short setup|short entry|sell zone|take profit|profit taking|stop loss|stop-loss|exit zone|resistance sell)\b",
+    r"\b(verkaufen|verkaufe|verkauft|reduzieren|abbauen|ausstieg|aussteigen|ausgestiegen|gewinnmitnahme|gewinne mitnehmen)\b",
+    r"\b(vendre|vendu|vente|sortie|réduire|prise de profit)\b",
+])
+HOLD_PATTERNS.extend([
+    r"\b(position|allocation|portfolio update|holding update|current holding|still holding|not selling)\b",
+    r"\b(halten|halte|hält|haelt|gehalten|positionierung|bestand|weiter halten|nicht verkaufen)\b",
+    r"\b(garder|conserver|position actuelle|portefeuille)\b",
+    r"\b(target zone|price target|support|resistance|trend line|chart setup|technical setup|elliott wave|wave count)\b",
+    r"\b(zielzone|kursziel|unterstützung|unterstuetzung|widerstand|trendlinie|chartanalyse|elliott wave|welle)\b",
+])
+WATCH_PATTERNS.extend([
+    r"\b(watchlist|watching|scenario|if.*then|possible setup|monitoring|waiting for confirmation)\b",
+    r"\b(beobachten|abwarten|szenario|möglich|moeglich|könnte|koennte|wenn.*dann|setup beobachten)\b",
+    r"\b(surveiller|scénario|possible|attendre|confirmation)\b",
+])
+NEGATION_PATTERNS.extend([
+    r"\b(not buying|no buy|would not buy|avoid|too risky|overvalued|bad setup)\b",
+    r"\b(nicht kaufen|kein kauf|würde nicht kaufen|wuerde nicht kaufen|finger weg|zu riskant|überbewertet|ueberbewertet)\b",
+    r"\b(ne pas acheter|éviter|trop risqué|surévalué)\b",
+])
+
 def infer_action(context: str) -> tuple[str, float]:
     ctx = context.lower()
 
@@ -293,9 +347,28 @@ def infer_action(context: str) -> tuple[str, float]:
     return "mention_only", 0.25
 
 
-def build_context(segments: list[dict[str, Any]], idx: int, window: int = 2) -> tuple[str, float, float]:
-    lo = max(0, idx - window)
-    hi = min(len(segments), idx + window + 1)
+def build_context(
+    segments: list[dict[str, Any]],
+    idx: int,
+    window: int = 2,
+    max_gap_seconds: float = 20.0,
+) -> tuple[str, float, float]:
+    lo = idx
+    for candidate in range(idx - 1, max(-1, idx - window - 1), -1):
+        candidate_end = float(segments[candidate].get("end", segments[candidate].get("start", 0.0)))
+        next_start = float(segments[candidate + 1].get("start", 0.0))
+        if next_start - candidate_end > max_gap_seconds:
+            break
+        lo = candidate
+
+    hi = idx + 1
+    for candidate in range(idx + 1, min(len(segments), idx + window + 1)):
+        previous_end = float(segments[candidate - 1].get("end", segments[candidate - 1].get("start", 0.0)))
+        candidate_start = float(segments[candidate].get("start", 0.0))
+        if candidate_start - previous_end > max_gap_seconds:
+            break
+        hi = candidate + 1
+
     context = " ".join(clean_text(s.get("text", "")) for s in segments[lo:hi])
     start = float(segments[lo].get("start", 0.0))
     end = float(segments[hi - 1].get("end", segments[hi - 1].get("start", 0.0)))
@@ -329,13 +402,22 @@ def extract_candidates(transcript_dir: Path) -> pd.DataFrame:
             context, start, end = build_context(segments, i, window=2)
             action, conf = infer_action(context)
             video_id = seg.get("video_id", "")
+            event_type = {
+                "buy_or_add": "buy_or_add",
+                "sell_or_reduce": "sell_or_reduce",
+                "hold_or_portfolio_holding": "holding_update",
+                "watchlist_or_uncertain": "watchlist",
+                "negative_or_not_buying": "negative_not_buying",
+            }.get(action, "mention_only")
 
             for ticker, company in matched:
                 rows.append(
                     {
+                        "video_id": video_id,
                         "video_date": seg.get("video_date", ""),
                         "video_title": seg.get("video_title", ""),
                         "video_url": seg.get("video_url", f"https://www.youtube.com/watch?v={video_id}"),
+                        "timestamp_seconds": int(start),
                         "timestamp_start_seconds": int(start),
                         "timestamp_end_seconds": int(end),
                         "timestamp_start": seconds_to_hhmmss(start),
@@ -344,7 +426,9 @@ def extract_candidates(transcript_dir: Path) -> pd.DataFrame:
                         "ticker": ticker,
                         "company": company,
                         "action_inferred": action,
+                        "event_type": event_type,
                         "confidence_rule_based": round(conf, 3),
+                        "source_method": seg.get("source_method", "saved_transcript"),
                         "quote_segment": text,
                         "context_window": context,
                         "manual_review": "yes" if conf < 0.75 or action in {"mention_only", "watchlist_or_uncertain", "negative_or_not_buying"} else "spot_check",
@@ -354,7 +438,7 @@ def extract_candidates(transcript_dir: Path) -> pd.DataFrame:
                     }
                 )
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=CANDIDATE_COLUMNS)
     if df.empty:
         return df
 
@@ -371,13 +455,17 @@ def make_review_template(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     keep = [
+        "video_id",
         "video_date",
         "video_title",
+        "timestamp_seconds",
         "timestamp_url",
         "ticker",
         "company",
         "action_inferred",
+        "event_type",
         "confidence_rule_based",
+        "source_method",
         "quote_segment",
         "context_window",
         "manual_review",
@@ -493,9 +581,21 @@ def main() -> None:
     ap.add_argument("--channel", default="https://www.youtube.com/@JosephCarlsonShow/videos")
     ap.add_argument("--max-videos", type=int, default=80)
     ap.add_argument("--skip-download", action="store_true", help="Use existing data/video_inventory.csv and transcripts.")
+    ap.add_argument("--root", default=".", help="Directory where data and outputs are written.")
+    ap.add_argument(
+        "--cookies-from-browser",
+        choices=["chrome", "edge", "firefox", "brave", "opera", "vivaldi"],
+        help="Optional browser session used by the yt-dlp subtitle fallback.",
+    )
+    ap.add_argument(
+        "--request-delay",
+        type=float,
+        default=0.75,
+        help="Seconds to wait between transcript requests.",
+    )
     args = ap.parse_args()
 
-    root = Path(__file__).resolve().parent
+    root = Path(args.root).resolve()
     data_dir = root / "data"
     transcript_dir = data_dir / "transcripts"
     processed_dir = data_dir / "processed"
@@ -517,7 +617,12 @@ def main() -> None:
     if args.skip_download and transcript_status_csv.exists():
         status = pd.read_csv(transcript_status_csv)
     else:
-        status = save_transcripts(inventory, transcript_dir)
+        status = save_transcripts(
+            inventory,
+            transcript_dir,
+            cookies_from_browser=args.cookies_from_browser,
+            request_delay=max(args.request_delay, 0.0),
+        )
         status.to_csv(transcript_status_csv, index=False)
 
     print("Bundling transcripts...")

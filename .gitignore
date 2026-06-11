@@ -9,6 +9,25 @@ data/transcripts/*.zip
 
 # Large/regen data
 data/market/*.csv
+data/video_inventory.csv
+data/transcript_status.csv
+data/processed/*.csv
+runs/
 
-# Optional: keep generated outputs out until cleaned
-# outputs/figures/*.png
+# Generated outputs
+outputs/charts/
+outputs/summary_report.md
+outputs/presentation_summary.md
+
+# Local patch artifacts kept outside the project history
+*.bak_universal
+universal_patch_files/
+APP_V4_NOTES.md
+APP_V5_NOTES.md
+UNIVERSAL_PATCH_NOTES.md
+README_dashboard_replacement.md
+apply_universal_patch.py
+ai_extract_events.py
+GITHUB_SETUP_POWERSHELL.md
+README_PROJECT_STYLE.md
+.streamlit-test.*.log

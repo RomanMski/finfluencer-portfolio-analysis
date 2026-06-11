@@ -1,74 +1,74 @@
 # Finfluencer Portfolio Analysis
 
-This is a small finance/data-science project for analysing stock recommendations from finance YouTube content.
+Source-backed extraction and portfolio analysis of finfluencer investment recommendations.
 
-The idea is simple: take timestamped video transcripts, extract stock-pick and portfolio-update candidates, turn them into a structured dataset, and compare the subsequent performance with broad market benchmarks.
+The app scans finance YouTube channels, downloads available transcripts, extracts stock, ETF and crypto recommendation candidates, and keeps a timestamp link and quote context for every row. When the evidence is strong enough, it builds a simple event portfolio and compares it with SPY and QQQ.
 
-The current version is a proof of concept. It is not meant to be a finished investment model. The extracted recommendations still need manual verification through the timestamp links before they can be used in the final academic analysis.
+This is an academic research tool, not an investment model. Extracted events should be manually checked before they are used in the final report.
 
-## What the pipeline does
+## Main features
 
-- collects YouTube video metadata and transcripts
-- extracts stock-pick / portfolio-update candidates from transcript text
-- keeps source links, timestamps and context for manual checking
-- cleans the extracted events into a usable CSV
-- downloads adjusted price data
-- computes first forward-return and event-portfolio results
-- compares the demo portfolio with SPY and QQQ
-- creates figures for the report/presentation
+- strict Buy/Add, Sell/Reduce and Holding extraction
+- loose Watchlist and scenario fallback for less structured creators
+- source fields for manual verification
+- separate saved runs for every creator
+- transcript, extraction and portfolio diagnostics
+- event portfolio, forward returns, drawdown and benchmark analysis
+- ticker price charts with recommendation markers
+- optional browser-session fallback when YouTube rate-limits transcripts
 
-## Example outputs
+Joseph Carlson is the main worked example, but the pipeline is designed for other finance channels as well.
+Model-assisted extraction can be added later, but it is not configured or required by the current app.
 
-### Event portfolio vs benchmarks
-
-![Event portfolio vs benchmarks](outputs/figures/05_event_portfolio_vs_benchmarks.png)
-
-### Drawdown comparison
-
-![Drawdown comparison](outputs/figures/06_drawdown_comparison.png)
-
-### Recommendation timeline
-
-![Recommendation timeline](outputs/figures/03_recommendation_timeline.png)
-
-### Performance summary
-
-![Performance metrics](outputs/figures/07_performance_metrics.png)
-
-## Current workflow
-
-1. Download/collect transcript and video metadata.
-2. Extract candidate stock recommendations with timestamps.
-3. Manually verify the important Buy/Sell/Hold rows.
-4. Build the final portfolio timeline.
-5. Compare performance against benchmarks.
-6. Use the verified dataset for regressions, event study and the final report.
-
-## Important limitations
-
-The current event portfolio is only a first demo. It uses a simple rule: enter after detected buy/add events, hold for a fixed period, and equal-weight active positions.
-
-For the final project, the recommendation rows should be manually verified, and the portfolio construction rules should be documented clearly.
-
-Raw full transcripts are intentionally not included in the repository.
-## Interactive dashboard
-
-The repository also includes a small Streamlit dashboard for exploring the extracted data.
-
-Run:
+## Install and run
 
 ```powershell
-pip install -r requirements_dashboard.txt
-streamlit run streamlit_app.py
+python -m pip install -r requirements.txt
+python -m streamlit run streamlit_app.py
 ```
 
-The dashboard shows:
+Paste a channel URL or handle, choose the number of videos and start the run. Results are stored under:
 
-- extracted recommendation candidates
-- timestamped source table
-- performance metrics
-- event portfolio vs SPY/QQQ
-- drawdowns
-- ticker-level price charts with buy/sell/holding markers
+```text
+runs/<timestamp>_<creator>/
+```
 
-The marker charts are useful for manual verification because each event keeps the timestamp URL and quote context.
+Each run keeps its own inventory, transcript status, candidate rows, market data, figures, logs and `manifest.json`. A failed creator run cannot overwrite a previous working dashboard.
+
+## Output levels
+
+The dashboard separates three outcomes:
+
+1. No transcripts: shows the download failure reasons, including YouTube IP blocks.
+2. Raw candidates only: shows ticker and action counts plus the timestamped source rows.
+3. Event portfolio: shows performance, risk, forward returns and source-backed events.
+
+The app does not force every creator into a portfolio. A clear diagnostic result is more useful than invented trades.
+
+## Verification
+
+Run the local extraction tests:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Run a live Joseph Carlson sanity check:
+
+```powershell
+python live_sanity_check.py --max-videos 20
+```
+
+If YouTube blocks anonymous transcript requests, the live check reports a skip with the failure count. You can also use a local browser session:
+
+```powershell
+python live_sanity_check.py --max-videos 20 --cookies-from-browser firefox
+```
+
+Close the selected browser before using its cookies if the cookie database is locked.
+
+## Research warning
+
+The demo portfolio enters on the next trading day after an extracted Buy/Add event, holds for a fixed number of trading days, and equal-weights active positions. The final academic analysis should use manually verified rows and clearly documented portfolio rules.
+
+Raw full transcripts and generated run folders are intentionally excluded from Git.

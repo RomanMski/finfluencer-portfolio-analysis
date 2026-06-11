@@ -6,7 +6,6 @@ import math
 import re
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 
 
 BENCHMARKS = ["SPY", "QQQ"]
@@ -165,7 +163,21 @@ def normalize_ticker_for_yfinance(ticker: str) -> str:
     mapping = {
         "BRK.B": "BRK-B",
         "BRK.A": "BRK-A",
-        "GOOG": "GOOGL",   # collapse Google class shares for cleaner charts
+        "GOOG": "GOOGL",
+        "XAUUSD": "GLD",
+        "XAGUSD": "SLV",
+        "GOLD": "GLD",
+        "SILVER": "SLV",
+        "DAX": "EWG",
+        "NASDAQ": "QQQ",
+        "NASDAQ100": "QQQ",
+        "SP500": "SPY",
+        "S&P500": "SPY",
+        "BTC": "BTC-USD",
+        "ETH": "ETH-USD",
+        "SOL": "SOL-USD",
+        "XRP": "XRP-USD",
+        "ADA": "ADA-USD",
     }
     return mapping.get(t, t)
 
@@ -200,9 +212,11 @@ def clean_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
     df["manual_verification_needed"] = True
 
     cols = [
+        "video_id",
         "video_date",
         "video_title",
         "video_url",
+        "timestamp_seconds",
         "timestamp_start",
         "timestamp_end",
         "timestamp_url",
@@ -212,6 +226,7 @@ def clean_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
         "event_type",
         "action_inferred",
         "confidence_rule_based",
+        "source_method",
         "quote_segment",
         "context_window",
         "use_for_demo_portfolio",
@@ -316,7 +331,7 @@ def build_event_portfolio(events: pd.DataFrame, prices: pd.DataFrame, holding_da
 
     long_events = events[events["use_for_demo_portfolio"]].copy()
     if long_events.empty:
-        raise RuntimeError("No buy/add events available for portfolio demo.")
+        return pd.DataFrame()
 
     active_by_day = {d: set() for d in idx}
 
@@ -617,9 +632,10 @@ def main() -> None:
     ap.add_argument("--holding-days", type=int, default=63)
     ap.add_argument("--refresh-inventory", action="store_true")
     ap.add_argument("--refresh-prices", action="store_true")
+    ap.add_argument("--root", default=".", help="Directory containing this run's data and outputs.")
     args = ap.parse_args()
 
-    root = Path(__file__).resolve().parent
+    root = Path(args.root).resolve()
     data_dir = root / "data"
     processed_dir = data_dir / "processed"
     market_dir = data_dir / "market"
@@ -654,9 +670,22 @@ def main() -> None:
     events.to_csv(events_out, index=False)
 
     if events.empty:
-        raise RuntimeError(
-            "No clean candidate events after filtering. Check whether video dates were fixed and candidates exist."
+        no_event_summary = root / "outputs" / "presentation_summary.md"
+        no_event_summary.parent.mkdir(parents=True, exist_ok=True)
+        no_event_summary.write_text(
+            "# Presentation summary\n\n"
+            "No clean tradeable candidate events were found after filtering.\n\n"
+            "The transcript collection finished, but the extractor did not find enough "
+            "buy/add, sell/reduce, or holding-update rows that matched the current asset "
+            "universe and action rules. This usually means the creator is not a clean fit "
+            "for portfolio reconstruction, or the universe/action vocabulary needs to be "
+            "extended for that channel.\n",
+            encoding="utf-8",
         )
+        print("\nDONE V2 - no clean candidate events found")
+        print(f"Clean events:      {events_out}")
+        print(f"Summary:           {no_event_summary}")
+        return
 
     start_date = (events["video_date"].min() - pd.Timedelta(days=5)).date().isoformat()
     end_date = (datetime.today() + timedelta(days=7)).date().isoformat()
@@ -673,6 +702,28 @@ def main() -> None:
     daily = build_event_portfolio(events, prices, holding_days=args.holding_days)
     daily_out = processed_dir / "event_portfolio_daily.csv"
     daily.to_csv(daily_out)
+
+    if daily.empty:
+        metrics_out = processed_dir / "performance_metrics.csv"
+        pd.DataFrame(
+            columns=[
+                "series",
+                "total_return",
+                "annualized_return",
+                "annualized_volatility",
+                "sharpe_0rf",
+                "max_drawdown",
+            ]
+        ).to_csv(metrics_out, index=False)
+        write_presentation_summary(
+            events,
+            fwd,
+            pd.DataFrame(),
+            root / "outputs" / "presentation_summary.md",
+            args.holding_days,
+        )
+        log("Clean events exist, but no explicit buy/add events were available for the strict portfolio.")
+        return
 
     log("Computing performance metrics.")
     metrics = compute_metrics(daily)
