@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from run_pipeline import classify_action_evidence
+
 
 BENCHMARKS = ["SPY", "QQQ"]
 HORIZONS = {
@@ -187,19 +189,60 @@ def clean_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
 
     df["video_date"] = pd.to_datetime(df["video_date"], errors="coerce")
     df = df.dropna(subset=["video_date"])
+    if "event_date" in df.columns:
+        df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
+        df["event_date"] = df["event_date"].fillna(df["video_date"])
+    else:
+        df["event_date"] = df["video_date"]
     df["ticker_raw"] = df["ticker"].astype(str).str.upper().str.strip()
     df["ticker"] = df["ticker_raw"].map(normalize_ticker_for_yfinance)
 
+    def classify_row(row: pd.Series) -> pd.Series:
+        values = [row.get("asset_context"), row.get("context_window"), row.get("quote_segment")]
+        text = next(
+            (
+                str(value)
+                for value in values
+                if value is not None and not pd.isna(value) and str(value).strip()
+            ),
+            "",
+        )
+        action, confidence, evidence_class, strict_eligible = classify_action_evidence(text)
+        if str(row.get("evidence_class", "")) == "historical_personal_trade":
+            evidence_class = "historical_personal_trade"
+            strict_eligible = False
+            confidence = max(confidence, 0.88)
+        return pd.Series(
+            {
+                "_action": action,
+                "_confidence": confidence,
+                "_evidence_class": evidence_class,
+                "_strict_eligible": strict_eligible,
+            }
+        )
+
+    classified = df.apply(classify_row, axis=1)
+    df["action_inferred"] = classified["_action"]
+    df["confidence_rule_based"] = classified["_confidence"]
+    df["evidence_class"] = classified["_evidence_class"]
+    df["strict_eligible"] = classified["_strict_eligible"]
+
     keep_actions = ["buy_or_add", "sell_or_reduce", "hold_or_portfolio_holding"]
-    df = df[df["action_inferred"].isin(keep_actions)].copy()
+    df = df[df["strict_eligible"] & df["action_inferred"].isin(keep_actions)].copy()
 
     if "confidence_rule_based" in df.columns:
         df["confidence_rule_based"] = pd.to_numeric(df["confidence_rule_based"], errors="coerce").fillna(0)
         df = df[df["confidence_rule_based"] >= 0.55].copy()
 
-    # Remove duplicate same ticker/action from same video. Keep the earliest timestamp.
-    df = df.sort_values(["video_date", "video_url", "ticker", "timestamp_start_seconds"])
-    df = df.drop_duplicates(subset=["video_url", "ticker", "action_inferred"], keep="first")
+    # One event per ticker/action/video is enough for daily portfolio reconstruction.
+    df = df.sort_values(
+        ["event_date", "video_url", "ticker", "action_inferred", "confidence_rule_based", "timestamp_start_seconds"],
+        ascending=[True, True, True, True, False, True],
+    )
+    df = df.drop_duplicates(
+        subset=["video_url", "ticker", "action_inferred", "event_date"],
+        keep="first",
+    )
 
     df["event_type"] = np.where(
         df["action_inferred"].eq("sell_or_reduce"),
@@ -207,13 +250,19 @@ def clean_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
         np.where(df["action_inferred"].eq("buy_or_add"), "buy_or_add", "holding_update"),
     )
 
-    # Portfolio demo uses only clear buy/add rows by default.
-    df["use_for_demo_portfolio"] = df["event_type"].eq("buy_or_add")
+    # Holdings are evidence, not dated entries. Only completed trades and explicit
+    # recommendations can open a demo portfolio position.
+    df["use_for_demo_portfolio"] = df["event_type"].eq("buy_or_add") & df[
+        "evidence_class"
+    ].isin(["personal_trade", "explicit_recommendation"])
     df["manual_verification_needed"] = True
 
     cols = [
         "video_id",
         "video_date",
+        "event_date",
+        "event_date_text",
+        "date_source",
         "video_title",
         "video_url",
         "timestamp_seconds",
@@ -225,9 +274,12 @@ def clean_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
         "company",
         "event_type",
         "action_inferred",
+        "evidence_class",
+        "strict_eligible",
         "confidence_rule_based",
         "source_method",
         "quote_segment",
+        "asset_context",
         "context_window",
         "use_for_demo_portfolio",
         "manual_verification_needed",
@@ -286,6 +338,11 @@ def nearest_trading_day(index: pd.DatetimeIndex, date: pd.Timestamp) -> pd.Times
     return index[pos]
 
 
+def event_timestamp(event: pd.Series) -> pd.Timestamp:
+    value = event.get("event_date", event.get("video_date"))
+    return pd.Timestamp(value)
+
+
 def compute_forward_returns(events: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
     rows = []
     idx = prices.index
@@ -294,7 +351,7 @@ def compute_forward_returns(events: pd.DataFrame, prices: pd.DataFrame) -> pd.Da
         ticker = ev["ticker"]
         if ticker not in prices.columns:
             continue
-        start_day = nearest_trading_day(idx, ev["video_date"] + pd.Timedelta(days=1))
+        start_day = nearest_trading_day(idx, event_timestamp(ev) + pd.Timedelta(days=1))
         if start_day is None:
             continue
         p0 = prices.loc[start_day, ticker]
@@ -334,21 +391,27 @@ def build_event_portfolio(events: pd.DataFrame, prices: pd.DataFrame, holding_da
         return pd.DataFrame()
 
     active_by_day = {d: set() for d in idx}
+    entry_days = []
 
     for _, ev in long_events.iterrows():
         ticker = ev["ticker"]
         if ticker not in prices.columns:
             continue
 
-        entry_day = nearest_trading_day(idx, ev["video_date"] + pd.Timedelta(days=1))
+        entry_day = nearest_trading_day(idx, event_timestamp(ev) + pd.Timedelta(days=1))
         if entry_day is None:
             continue
         start_pos = idx.get_loc(entry_day)
+        entry_days.append(entry_day)
+        return_start_pos = start_pos + 1
         end_pos = min(start_pos + holding_days, len(idx) - 1)
 
-        for d in idx[start_pos:end_pos + 1]:
+        for d in idx[return_start_pos:end_pos + 1]:
             if not pd.isna(prices.loc[d, ticker]):
                 active_by_day[d].add(ticker)
+
+    if not entry_days:
+        return pd.DataFrame()
 
     rows = []
     for d in idx:
@@ -370,10 +433,12 @@ def build_event_portfolio(events: pd.DataFrame, prices: pd.DataFrame, holding_da
         )
 
     daily = pd.DataFrame(rows).set_index("date")
-    # Trim to period with at least one active position
-    if daily["n_active"].gt(0).any():
-        first = daily.index[daily["n_active"].gt(0)][0]
-        daily = daily.loc[first:].copy()
+    # Keep the entry close as a $1 baseline; returns start on the following day.
+    if entry_days:
+        daily = daily.loc[min(entry_days):].copy()
+        for column in ["event_portfolio_return", "SPY_return", "QQQ_return"]:
+            if column in daily.columns:
+                daily.iloc[0, daily.columns.get_loc(column)] = 0.0
 
     for c in ["event_portfolio_return", "SPY_return", "QQQ_return"]:
         if c in daily.columns:
@@ -475,10 +540,10 @@ def make_figures(events: pd.DataFrame, fwd: pd.DataFrame, daily: pd.DataFrame, m
     tl["y"] = tl["ticker"].map(ymap)
     plt.figure(figsize=(11, 6))
     for etype, g in tl.groupby("event_type"):
-        plt.scatter(g["video_date"], g["y"], label=etype, alpha=0.8, s=35)
+        plt.scatter(g["event_date"], g["y"], label=etype, alpha=0.8, s=35)
     plt.yticks(list(ymap.values()), list(ymap.keys()))
     plt.title("Timestamped recommendation timeline")
-    plt.xlabel("Video upload date")
+    plt.xlabel("Event date")
     plt.ylabel("Ticker")
     plt.legend(loc="best")
     plt.tight_layout()
@@ -518,7 +583,7 @@ def make_figures(events: pd.DataFrame, fwd: pd.DataFrame, daily: pd.DataFrame, m
     ]:
         if col in daily.columns:
             plt.plot(daily.index, daily[col], label=label)
-    plt.title("Demo event portfolio vs benchmarks")
+    plt.title("Strict event portfolio vs benchmarks")
     plt.xlabel("Date")
     plt.ylabel("Growth of $1")
     plt.legend()
@@ -572,8 +637,8 @@ def make_figures(events: pd.DataFrame, fwd: pd.DataFrame, daily: pd.DataFrame, m
 
 
 def write_presentation_summary(events: pd.DataFrame, fwd: pd.DataFrame, metrics: pd.DataFrame, out_path: Path, holding_days: int) -> None:
-    start = events["video_date"].min().date().isoformat() if not events.empty else ""
-    end = events["video_date"].max().date().isoformat() if not events.empty else ""
+    start = events["event_date"].min().date().isoformat() if not events.empty else ""
+    end = events["event_date"].max().date().isoformat() if not events.empty else ""
 
     n_events = len(events)
     n_buy = int((events["event_type"] == "buy_or_add").sum()) if not events.empty else 0
@@ -687,7 +752,7 @@ def main() -> None:
         print(f"Summary:           {no_event_summary}")
         return
 
-    start_date = (events["video_date"].min() - pd.Timedelta(days=5)).date().isoformat()
+    start_date = (events["event_date"].min() - pd.Timedelta(days=5)).date().isoformat()
     end_date = (datetime.today() + timedelta(days=7)).date().isoformat()
     tickers = sorted(events["ticker"].dropna().unique().tolist())
 

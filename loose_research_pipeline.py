@@ -9,6 +9,8 @@ import re
 import numpy as np
 import pandas as pd
 
+from run_pipeline import classify_action_evidence
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -66,42 +68,14 @@ def infer_event_type(row: pd.Series) -> str:
     }).lower()
 
     blob = f"{action} {text}"
-
-    if any(x in blob for x in [
-        "negative_not_buying", "negative_or_not_buying", "not buying", "avoid",
-        "too risky", "kein kauf", "nicht kaufen",
-    ]):
-        return "negative_not_buying"
-
-    if any(x in blob for x in [
-        "sell_or_reduce", "sell", "sold", "selling", "reduce", "reduced",
-        "short", "exit", "take profit", "profit taking", "verkaufen", "verkauft",
-        "ausstieg", "gewinnmitnahme",
-    ]):
-        return "sell_or_reduce"
-
-    if any(x in blob for x in [
-        "buy_or_add", "buy", "bought", "buying", "add", "adding", "long",
-        "entry", "entry zone", "accumulate", "kaufen", "gekauft", "nachkaufen",
-        "einstieg", "kaufzone",
-    ]):
-        return "buy_or_add"
-
-    if any(x in blob for x in [
-        "hold", "holding", "portfolio", "position", "still own", "still holding",
-        "halten", "positionierung", "bestand",
-    ]):
-        return "holding_update"
-
-    if any(x in blob for x in [
-        "watch", "watchlist", "scenario", "target", "support", "resistance",
-        "setup", "waiting", "beobachten", "szenario", "zielzone", "unterstützung",
-        "widerstand",
-    ]):
-        return "watchlist"
-
-    return "mention_only"
-
+    classified_action, _, _, _ = classify_action_evidence(blob)
+    return {
+        "buy_or_add": "buy_or_add",
+        "sell_or_reduce": "sell_or_reduce",
+        "hold_or_portfolio_holding": "holding_update",
+        "watchlist_or_uncertain": "watchlist",
+        "negative_or_not_buying": "negative_not_buying",
+    }.get(classified_action, "mention_only")
 
 def load_candidates(root: Path) -> pd.DataFrame:
     path = root / "data" / "processed" / "stock_pick_candidates.csv"
@@ -159,13 +133,39 @@ def build_events(root: Path, min_confidence: float = 0.0, include_watchlist: boo
     df["ticker"] = df[ticker_col].map(normalize_ticker)
     df = df[df["ticker"].notna() & df["ticker"].astype(str).str.len().gt(0)].copy()
 
-    df["event_type"] = df.apply(infer_event_type, axis=1)
+    def classify_row(row: pd.Series) -> pd.Series:
+        parts = []
+        for column in ["asset_context", "context_window", "quote_segment", "video_title"]:
+            value = row.get(column, "")
+            if value is not None and not pd.isna(value) and str(value).strip():
+                parts.append(str(value))
+        text = " ".join(parts)
+        action, confidence, evidence_class, strict_eligible = classify_action_evidence(text)
+        return pd.Series(
+            {
+                "action_inferred": action,
+                "event_type": {
+                    "buy_or_add": "buy_or_add",
+                    "sell_or_reduce": "sell_or_reduce",
+                    "hold_or_portfolio_holding": "holding_update",
+                    "watchlist_or_uncertain": "watchlist",
+                    "negative_or_not_buying": "negative_not_buying",
+                }.get(action, "mention_only"),
+                "_classified_confidence": confidence,
+                "evidence_class": evidence_class,
+                "strict_eligible": strict_eligible,
+            }
+        )
+
+    classified = df.apply(classify_row, axis=1)
+    for column in classified.columns:
+        df[column] = classified[column]
 
     confidence_col = find_col(df, ["confidence_rule_based", "confidence", "score"])
     if confidence_col:
         df["_confidence"] = pd.to_numeric(df[confidence_col], errors="coerce").fillna(0.5)
     else:
-        df["_confidence"] = 0.5
+        df["_confidence"] = df["_classified_confidence"]
 
     # Loose mode: keep clean actions and watchlist/scenario rows, but still drop pure mentions.
     keep = ["buy_or_add", "sell_or_reduce", "holding_update"]
@@ -180,16 +180,21 @@ def build_events(root: Path, min_confidence: float = 0.0, include_watchlist: boo
 
     df = df.dropna(subset=["video_date"]).copy()
     df["video_date"] = pd.to_datetime(df["video_date"]).dt.normalize()
+    if "event_date" in df.columns:
+        df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
+        df["event_date"] = df["event_date"].fillna(df["video_date"]).dt.normalize()
+    else:
+        df["event_date"] = df["video_date"]
 
     for col in ["company", "video_title", "timestamp_url", "quote_segment", "context_window"]:
         if col not in df.columns:
             df[col] = ""
 
     # Prevent repeated duplicates from same video/asset/action.
-    dedup_cols = ["video_date", "ticker", "event_type", "video_title"]
+    dedup_cols = ["event_date", "ticker", "event_type", "video_title"]
     df = df.drop_duplicates(subset=dedup_cols)
 
-    return df.sort_values(["video_date", "ticker", "event_type"]).reset_index(drop=True)
+    return df.sort_values(["event_date", "ticker", "event_type"]).reset_index(drop=True)
 
 
 def download_prices(tickers: list[str], start: str, end: str, refresh: bool, root: Path) -> pd.DataFrame:
@@ -249,12 +254,13 @@ def build_portfolio(events: pd.DataFrame, prices: pd.DataFrame, holding_days: in
     if events.empty or prices.empty:
         return pd.DataFrame()
 
-    # Prefer explicit buy/add. If a creator has no explicit buys, fall back to watch/holding rows.
-    buy_events = events[events["event_type"].eq("buy_or_add")].copy()
+    # Loose mode can display uncertain rows, but it must never turn them into trades.
+    eligible = events.get("strict_eligible", pd.Series(False, index=events.index)).fillna(False)
+    eligible = eligible.map(
+        lambda value: value if isinstance(value, bool) else str(value).lower() == "true"
+    )
+    buy_events = events[events["event_type"].eq("buy_or_add") & eligible].copy()
     mode = "explicit_buy"
-    if buy_events.empty:
-        buy_events = events[events["event_type"].isin(["watchlist", "holding_update"])].copy()
-        mode = "loose_watch_or_holding"
 
     if buy_events.empty:
         return pd.DataFrame()
@@ -263,21 +269,27 @@ def build_portfolio(events: pd.DataFrame, prices: pd.DataFrame, holding_days: in
     returns = prices.pct_change().fillna(0.0)
 
     active_by_day = {}
+    entry_days = []
     for _, row in buy_events.iterrows():
         ticker = row["ticker"]
         if ticker not in prices.columns:
             continue
 
-        entry = next_trading_day(price_index, row["video_date"] + pd.Timedelta(days=1))
+        entry = next_trading_day(price_index, row["event_date"] + pd.Timedelta(days=1))
         if entry is None:
             continue
 
         entry_pos = price_index.get_loc(entry)
+        entry_days.append(entry)
+        return_start_pos = entry_pos + 1
         exit_pos = min(entry_pos + int(holding_days), len(price_index) - 1)
-        held_dates = price_index[entry_pos:exit_pos + 1]
+        held_dates = price_index[return_start_pos:exit_pos + 1]
 
         for d in held_dates:
             active_by_day.setdefault(d, []).append(ticker)
+
+    if not entry_days:
+        return pd.DataFrame()
 
     rows = []
     for d in price_index:
@@ -289,11 +301,15 @@ def build_portfolio(events: pd.DataFrame, prices: pd.DataFrame, holding_days: in
         rows.append({"date": d, "event_portfolio_return": r, "active_positions": len(active), "portfolio_mode": mode})
 
     out = pd.DataFrame(rows).set_index("date")
+    if entry_days:
+        out = out.loc[min(entry_days):].copy()
+        out.iloc[0, out.columns.get_loc("event_portfolio_return")] = 0.0
     out["event_portfolio_growth"] = (1 + out["event_portfolio_return"]).cumprod()
 
     for bench in ["SPY", "QQQ"]:
         if bench in prices.columns:
             out[f"{bench}_return"] = prices[bench].pct_change().fillna(0.0)
+            out.iloc[0, out.columns.get_loc(f"{bench}_return")] = 0.0
             out[f"{bench}_growth"] = (1 + out[f"{bench}_return"]).cumprod()
 
     return out
@@ -331,7 +347,7 @@ def build_forward_returns(events: pd.DataFrame, prices: pd.DataFrame) -> pd.Data
         if ticker not in prices.columns:
             continue
 
-        entry = next_trading_day(idx, ev["video_date"] + pd.Timedelta(days=1))
+        entry = next_trading_day(idx, ev["event_date"] + pd.Timedelta(days=1))
         if entry is None:
             continue
         entry_pos = idx.get_loc(entry)
@@ -376,7 +392,7 @@ def main() -> None:
         log("No candidate events could be converted into a loose event dataset.")
         return
 
-    start = (events["video_date"].min() - pd.Timedelta(days=10)).date().isoformat()
+    start = (events["event_date"].min() - pd.Timedelta(days=10)).date().isoformat()
     end = (datetime.now().date() + timedelta(days=2)).isoformat()
     tickers = events["ticker"].dropna().unique().tolist()
 

@@ -84,7 +84,14 @@ def discover_runs() -> list[Path]:
     if not RUNS_ROOT.exists():
         return []
     runs = [path for path in RUNS_ROOT.iterdir() if path.is_dir() and manifest_path(path).exists()]
-    return sorted(runs, reverse=True)
+    return sorted(
+        runs,
+        key=lambda path: (
+            read_manifest(path).get("created_at", ""),
+            path.stat().st_mtime,
+        ),
+        reverse=True,
+    )
 
 
 def run_label(run_dir: Path) -> str:
@@ -208,7 +215,11 @@ def load_csv(path: Path, date_columns: tuple[str, ...] = ()) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     try:
-        return pd.read_csv(path, parse_dates=list(date_columns))
+        frame = pd.read_csv(path)
+        for column in date_columns:
+            if column in frame.columns:
+                frame[column] = pd.to_datetime(frame[column], errors="coerce")
+        return frame
     except (pd.errors.EmptyDataError, OSError, ValueError):
         return pd.DataFrame()
 
@@ -218,8 +229,8 @@ def load_run_data(run_dir: Path) -> dict[str, pd.DataFrame]:
         "inventory": load_csv(run_dir / "data/video_inventory.csv"),
         "status": load_csv(run_dir / "data/transcript_status.csv"),
         "candidates": load_csv(run_dir / "data/processed/stock_pick_candidates.csv"),
-        "events": load_csv(run_dir / "data/processed/clean_candidate_events.csv", ("video_date",)),
-        "forward": load_csv(run_dir / "data/processed/forward_returns.csv", ("video_date",)),
+        "events": load_csv(run_dir / "data/processed/clean_candidate_events.csv", ("video_date", "event_date")),
+        "forward": load_csv(run_dir / "data/processed/forward_returns.csv", ("video_date", "event_date")),
         "daily": load_csv(run_dir / "data/processed/event_portfolio_daily.csv", ("date",)),
         "metrics": load_csv(run_dir / "data/processed/performance_metrics.csv"),
         "prices": load_csv(run_dir / "data/market/adj_close.csv", ("Date",)),
@@ -265,18 +276,36 @@ def mentioned_buy_hold_growth(
     available = sorted(set(events["ticker"].dropna()).intersection(prices.columns))
     if not available:
         return pd.Series(dtype=float)
-    start_date = pd.Timestamp(events["video_date"].min())
-    frame = prices[available].loc[
+    date_column = "event_date" if "event_date" in events.columns else "video_date"
+    start_date = pd.Timestamp(events[date_column].min())
+    index = prices.index[
         (prices.index >= start_date) & (prices.index <= pd.Timestamp(end_date))
     ]
-    frame = frame.dropna(axis=1, how="all")
-    if frame.empty:
+    if index.empty:
         return pd.Series(dtype=float)
-    normalized = frame.apply(
-        lambda series: series / series.dropna().iloc[0] if not series.dropna().empty else series,
-        axis=0,
-    )
-    return normalized.mean(axis=1).dropna()
+
+    growth_series = []
+    for ticker in available:
+        first_event = pd.Timestamp(
+            events.loc[events["ticker"].eq(ticker), date_column].min()
+        )
+        entry_position = prices.index.searchsorted(first_event + pd.Timedelta(days=1), side="left")
+        if entry_position >= len(prices.index):
+            continue
+        entry_date = prices.index[entry_position]
+        ticker_prices = prices[ticker].reindex(index)
+        entry_price = prices.loc[entry_date, ticker]
+        if pd.isna(entry_price) or entry_price <= 0:
+            continue
+        growth = pd.Series(1.0, index=index, name=ticker)
+        growth.loc[growth.index >= entry_date] = (
+            ticker_prices.loc[ticker_prices.index >= entry_date] / entry_price
+        )
+        growth_series.append(growth.ffill())
+
+    if not growth_series:
+        return pd.Series(dtype=float)
+    return pd.concat(growth_series, axis=1).mean(axis=1)
 
 
 def growth_chart(
@@ -300,11 +329,11 @@ def growth_chart(
                     x=mentioned_growth.index,
                     y=mentioned_growth,
                     mode="lines",
-                    name="Mentioned tickers buy and hold",
+                    name="Staggered event-ticker buy and hold",
                 )
             )
     figure.update_layout(
-        title="Portfolio performance",
+        title="Strict source-backed portfolio performance",
         xaxis_title="Date",
         yaxis_title="Growth of $1",
         hovermode="x unified",
@@ -340,12 +369,18 @@ def drawdown_chart(daily: pd.DataFrame) -> go.Figure:
 def event_timeline(events: pd.DataFrame) -> go.Figure:
     top = events["ticker"].value_counts().head(20).index
     frame = events[events["ticker"].isin(top)].copy()
+    date_column = "event_date" if "event_date" in frame.columns else "video_date"
     return px.scatter(
         frame,
-        x="video_date",
+        x=date_column,
         y="ticker",
-        color="event_type",
-        hover_data=["video_title", "timestamp_url", "quote_segment"],
+        color="evidence_class" if "evidence_class" in frame.columns else "event_type",
+        symbol="event_type",
+        hover_data=[
+            column
+            for column in ["video_date", "video_title", "timestamp_url", "quote_segment"]
+            if column in frame.columns
+        ],
         title="Source-backed event timeline",
         template="plotly_white",
         height=540,
@@ -398,7 +433,8 @@ def ticker_chart(events: pd.DataFrame, prices: pd.DataFrame, ticker: str) -> go.
             rows = ticker_events[ticker_events["event_type"].eq(event_type)]
             xs, ys, texts = [], [], []
             for _, row in rows.iterrows():
-                position = series.index.searchsorted(pd.Timestamp(row["video_date"]), side="left")
+                event_date = row.get("event_date", row["video_date"])
+                position = series.index.searchsorted(pd.Timestamp(event_date), side="left")
                 if position >= len(series):
                     continue
                 date = series.index[position]
@@ -455,16 +491,17 @@ def show_diagnostics(run_dir: Path, data: dict[str, pd.DataFrame]) -> None:
     candidates = data["candidates"]
     if not candidates.empty:
         left, right = st.columns(2)
-        if "action_inferred" in candidates.columns:
-            action_counts = candidates["action_inferred"].value_counts().reset_index()
-            action_counts.columns = ["action", "count"]
+        evidence_column = "evidence_class" if "evidence_class" in candidates.columns else "action_inferred"
+        if evidence_column in candidates.columns:
+            action_counts = candidates[evidence_column].value_counts().reset_index()
+            action_counts.columns = ["evidence", "count"]
             left.plotly_chart(
                 px.bar(
                     action_counts,
                     x="count",
-                    y="action",
+                    y="evidence",
                     orientation="h",
-                    title="Raw candidate actions",
+                    title="Candidate evidence classes",
                     template="plotly_white",
                 ),
                 width="stretch",
@@ -489,14 +526,20 @@ def source_table(frame: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "video_id",
         "video_date",
+        "event_date",
+        "event_date_text",
+        "date_source",
         "video_title",
         "ticker",
         "company",
         "event_type",
         "action_inferred",
+        "evidence_class",
+        "strict_eligible",
         "timestamp_seconds",
         "timestamp_url",
         "quote_segment",
+        "asset_context",
         "context_window",
         "confidence_rule_based",
         "source_method",
@@ -642,6 +685,7 @@ with st.container(border=True):
                 )
 
             st.cache_data.clear()
+            st.session_state["saved_run_label"] = run_label(run_dir)
             st.rerun()
 
 
@@ -651,7 +695,9 @@ with st.sidebar:
     st.header("Saved runs")
     if runs:
         labels = [run_label(run) for run in runs]
-        selected_label = st.selectbox("Run", labels, index=0)
+        if st.session_state.get("saved_run_label") not in labels:
+            st.session_state["saved_run_label"] = labels[0]
+        selected_label = st.selectbox("Run", labels, key="saved_run_label")
         selected_run = runs[labels.index(selected_label)]
         st.caption(read_manifest(selected_run).get("channel", ""))
     else:
@@ -694,14 +740,16 @@ if events.empty:
 
 events["video_date"] = pd.to_datetime(events["video_date"], errors="coerce")
 events = events.dropna(subset=["video_date"])
-start = events["video_date"].min()
-end = events["video_date"].max()
+date_column = "event_date" if "event_date" in events.columns else "video_date"
+events[date_column] = pd.to_datetime(events[date_column], errors="coerce")
+start = events[date_column].min()
+end = events[date_column].max()
 
 summary_columns = st.columns(4)
 summary_columns[0].metric("Events", len(events))
 summary_columns[1].metric("Unique tickers", events["ticker"].nunique())
-summary_columns[2].metric("Sample start", start.date().isoformat() if pd.notna(start) else "")
-summary_columns[3].metric("Sample end", end.date().isoformat() if pd.notna(end) else "")
+summary_columns[2].metric("First event", start.date().isoformat() if pd.notna(start) else "")
+summary_columns[3].metric("Last event", end.date().isoformat() if pd.notna(end) else "")
 
 performance_columns = st.columns(4)
 performance_columns[0].metric(
@@ -743,7 +791,18 @@ if not forward.empty:
 
 available_tickers = sorted(set(events["ticker"]).intersection(prices.columns))
 if available_tickers:
-    selected_ticker = st.selectbox("Ticker price chart", available_tickers)
+    buy_rows = events[events["event_type"].eq("buy_or_add")].sort_values(date_column)
+    preferred_ticker = buy_rows.iloc[0]["ticker"] if not buy_rows.empty else available_tickers[0]
+    default_index = (
+        available_tickers.index(preferred_ticker)
+        if preferred_ticker in available_tickers
+        else 0
+    )
+    selected_ticker = st.selectbox(
+        "Ticker price chart",
+        available_tickers,
+        index=default_index,
+    )
     st.plotly_chart(ticker_chart(events, prices, selected_ticker), width="stretch")
 
 st.subheader("Source-backed events")

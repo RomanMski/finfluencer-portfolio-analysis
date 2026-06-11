@@ -21,6 +21,9 @@ from src.transcripts import classify_transcript_error, fetch_transcript_segments
 CANDIDATE_COLUMNS = [
     "video_id",
     "video_date",
+    "event_date",
+    "event_date_text",
+    "date_source",
     "video_title",
     "video_url",
     "timestamp_seconds",
@@ -33,9 +36,12 @@ CANDIDATE_COLUMNS = [
     "company",
     "action_inferred",
     "event_type",
+    "evidence_class",
+    "strict_eligible",
     "confidence_rule_based",
     "source_method",
     "quote_segment",
+    "asset_context",
     "context_window",
     "manual_review",
     "verified_action",
@@ -322,29 +328,206 @@ NEGATION_PATTERNS.extend([
     r"\b(ne pas acheter|éviter|trop risqué|surévalué)\b",
 ])
 
+PERSONAL_BUY_PATTERNS = [
+    r"\b(?:i|we)\s+(?:just\s+|recently\s+|already\s+|have\s+|had\s+|originally\s+|continue(?:d)?\s+to\s+)*(?:bought|purchased|added|accumulated|invested|entered|initiated|opened)\b",
+    r"\b(?:i'm|i am|we're|we are)\s+(?:still\s+|currently\s+)?investing\b",
+    r"\b(?:i|we)\s+(?:was|were)\s+(?:buying|adding|investing)\b",
+    r"\b(?:my|our)\s+(?:latest\s+|recent\s+|new\s+)?(?:buy|purchase|entry)\b",
+    r"\banother\s+\$[\d,.]+\s+(?:worth\s+)?of\b",
+    r"\bwir\s+sind\s+(?:bereits\s+)?eingestiegen\b",
+    r"\bsind\s+wir\s+(?:bereits\s+)?eingestiegen\b",
+    r"\b(?:ich|wir)\s+hab(?:e|en)\s+(?:bereits\s+|neu\s+)?(?:gekauft|nachgekauft|aufgestockt)\b",
+    r"\b(?:j'ai|nous avons)\s+(?:achete|acheté|ajoute|ajouté|investi)\b",
+]
+PERSONAL_SELL_PATTERNS = [
+    r"\b(?:i|we)\s+(?:just\s+|recently\s+|have\s+|had\s+)*(?:sold|trimmed|reduced|exited|closed)\b",
+    r"\b(?:i'm|i am|we're|we are)\s+(?:selling|trimming|reducing|exiting)\b",
+    r"\b(?:my|our)\s+(?:latest\s+|recent\s+)?(?:sale|trim|exit)\b",
+    r"\b(?:ich|wir)\s+hab(?:e|en)\s+(?:verkauft|reduziert|abgebaut)\b",
+]
+PERSONAL_HOLD_PATTERNS = [
+    r"\b(?:i|we)\s+(?:still\s+|currently\s+)?(?:own|hold)\b",
+    r"\b(?:i|we)\s+have\b.{0,50}\b(?:shares?|position|holding|stock)\b",
+    r"\b(?:i'm|i am|we're|we are)\s+not\s+selling\b",
+    r"\b(?:my|our)\s+(?:current\s+)?(?:portfolio|position|holding|shares|allocation)\b",
+    r"\b(?:i|we)\s+have\s+\d[\d,.]*\s+shares\b",
+    r"\b(?:i|we)\s+(?:have|had)\s+(?:zero|no|0%)\s+interest\s+in\s+selling\b",
+    r"\b(?:ich|wir)\s+(?:halte|halten|besitze|besitzen)\b",
+    r"\b(?:mein|unser)(?:e|er|en)?\s+(?:depot|portfolio|position|bestand)\b",
+]
+EXPLICIT_RECOMMENDATION_PATTERNS = [
+    r"\b(?:strong|easy|clear|obvious)\s+buy\b",
+    r"\b(?:i|we)\s+(?:would|will)\s+buy\b",
+    r"\b(?:i|we)\s+(?:think|believe|consider)\b.{0,80}\b(?:is|looks like)\s+(?:a\s+)?buy\b",
+    r"\b(?:you|investors?)\s+should\s+buy\b",
+    r"\b(?:recommend|recommended|recommendation)\b.{0,40}\b(?:buy|buying)\b",
+    r"\b(?:klare|starke|eindeutige)\s+kauf(?:chance|empfehlung)?\b",
+]
+PLANNED_OR_WATCH_PATTERNS = [
+    r"\b(?:watchlist|watching|considering|considered|planning|plan to|might buy|could buy|possible entry|entry zone|target zone|waiting for confirmation)\b",
+    r"\b(?:will|would)\s+(?:add|enter|start|open)\b",
+    r"\b(?:not yet|no)\s+(?:buy|entry|position)\b",
+    r"\b(?:noch kein einstieg|demn[aä]chst aufnehmen|werden .*einsteigen|werden .*aufnehmen|zielzone|einstiegszone|shortlist|potenziell)\b",
+]
+NOT_BUY_PATTERNS = [
+    r"\b(?:not|never)\s+buy(?:ing)?\b",
+    r"\b(?:wouldn't|would not|don't|do not|didn't|did not|can't|cannot)\b.{0,50}\b(?:buy(?:ing)?|purchas(?:e|ing)|add(?:ing)?|invest(?:ing)?)\b",
+    r"\b(?:decided|chose)\s+not\s+to\b.{0,40}\b(?:buy|add|invest)\b",
+    r"\bultimately\s+decided\s+not\s+to\b",
+    r"\btoo\s+(?:expensive|risky)\s+to\s+buy\b",
+    r"\b(?:nicht kaufen|kein kauf|finger weg|zu riskant|ueberbewertet|überbewertet)\b",
+]
+MARKET_MOVEMENT_PATTERNS = [
+    r"\b(?:stock|shares?|market|company|price)\s+(?:has\s+|have\s+|is\s+|are\s+|was\s+|were\s+)?(?:sold off|selling off|traded down|down|dropping|falling)\b",
+    r"\b(?:sell-off|selloff|selling off|sold down|getting traded down)\b",
+]
+THIRD_PARTY_ACTION_PATTERNS = [
+    r"\b(?:he|she|they|investors?|workers?|analysts?|buffett|burry|ackman|wood)\b.{0,100}\b(?:bought|buying|sold|selling|added|trimmed|reduced|invested)\b",
+]
+
+
+def _matches_any(patterns: list[str], text: str) -> bool:
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def classify_action_evidence(context: str) -> tuple[str, float, str, bool]:
+    """Classify creator evidence without treating market chatter as a creator trade."""
+    ctx = clean_text(context).lower().replace("’", "'")
+
+    if _matches_any(NOT_BUY_PATTERNS, ctx):
+        return "negative_or_not_buying", 0.92, "negative_or_rejected", False
+    if _matches_any(PERSONAL_SELL_PATTERNS, ctx):
+        return "sell_or_reduce", 0.96, "personal_trade", True
+    if _matches_any(PERSONAL_BUY_PATTERNS, ctx):
+        return "buy_or_add", 0.96, "personal_trade", True
+    if _matches_any(PLANNED_OR_WATCH_PATTERNS, ctx):
+        return "watchlist_or_uncertain", 0.86, "planned_or_watchlist", False
+    if _matches_any(MARKET_MOVEMENT_PATTERNS, ctx):
+        return "mention_only", 0.88, "market_movement", False
+    if _matches_any(THIRD_PARTY_ACTION_PATTERNS, ctx):
+        return "mention_only", 0.88, "third_party_action", False
+    if _matches_any(EXPLICIT_RECOMMENDATION_PATTERNS, ctx):
+        return "buy_or_add", 0.90, "explicit_recommendation", True
+    if _matches_any(PERSONAL_HOLD_PATTERNS, ctx):
+        return "hold_or_portfolio_holding", 0.90, "personal_holding", True
+
+    if _matches_any(SELL_PATTERNS, ctx):
+        return "sell_or_reduce", 0.45, "generic_action_language", False
+    if _matches_any(BUY_PATTERNS, ctx):
+        return "buy_or_add", 0.45, "generic_action_language", False
+    if _matches_any(HOLD_PATTERNS, ctx):
+        return "hold_or_portfolio_holding", 0.40, "generic_holding_language", False
+    if _matches_any(WATCH_PATTERNS, ctx):
+        return "watchlist_or_uncertain", 0.40, "planned_or_watchlist", False
+    return "mention_only", 0.25, "mention_only", False
+
+
 def infer_action(context: str) -> tuple[str, float]:
-    ctx = context.lower()
+    action, confidence, _, _ = classify_action_evidence(context)
+    return action, confidence
 
-    def score(patterns: list[str]) -> int:
-        return sum(1 for p in patterns if re.search(p, ctx, flags=re.IGNORECASE))
 
-    neg = score(NEGATION_PATTERNS)
-    buy = score(BUY_PATTERNS)
-    sell = score(SELL_PATTERNS)
-    hold = score(HOLD_PATTERNS)
-    watch = score(WATCH_PATTERNS)
+def asset_local_context(context: str, patterns: list[re.Pattern], radius: int = 240) -> str:
+    spans = [match.span() for pattern in patterns for match in pattern.finditer(context)]
+    if not spans:
+        return clean_text(context)
 
-    if neg and buy:
-        return "negative_or_not_buying", 0.65
-    if sell:
-        return "sell_or_reduce", min(0.95, 0.65 + 0.1 * sell)
-    if buy:
-        return "buy_or_add", min(0.95, 0.65 + 0.1 * buy)
-    if hold:
-        return "hold_or_portfolio_holding", min(0.90, 0.55 + 0.1 * hold)
-    if watch:
-        return "watchlist_or_uncertain", 0.45
-    return "mention_only", 0.25
+    clauses = []
+    for match_start, match_end in spans:
+        boundaries_before = [
+            context.rfind(mark, 0, match_start)
+            for mark in [".", "!", "?", ";"]
+        ]
+        clause_start = max(boundaries_before) + 1
+        boundaries_after = [
+            position
+            for mark in [".", "!", "?", ";"]
+            if (position := context.find(mark, match_end)) >= 0
+        ]
+        clause_end = min(boundaries_after) + 1 if boundaries_after else len(context)
+        clause = clean_text(context[clause_start:clause_end])
+        if clause and clause not in clauses:
+            clauses.append(clause)
+
+    selected = clean_text(" ".join(clauses))
+    if selected:
+        return selected
+
+    start = max(0, min(span[0] for span in spans) - radius)
+    end = min(len(context), max(span[1] for span in spans) + radius)
+    return clean_text(context[start:end])
+
+
+def action_adjacent_context(context: str, local_context: str) -> str:
+    start = context.find(local_context)
+    if start < 0:
+        return local_context
+    end = start + len(local_context)
+    after = context[end:].lstrip(" .!?;")
+    next_clause = re.split(r"[.!?;]", after, maxsplit=1)[0].strip()
+    if re.match(
+        r"^(?:i|we|my|our|ich|wir|mein|unser|not|no|noch|when|sobald|this|it|bought|sold|entered|eingestiegen|gekauft|verkauft)\b",
+        next_clause,
+        flags=re.IGNORECASE,
+    ):
+        return clean_text(f"{local_context} {next_clause}")
+    return local_context
+
+
+MONTH_NUMBERS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def infer_event_date(context: str, video_date: str) -> tuple[str, str, str]:
+    try:
+        upload_date = pd.Timestamp(video_date).normalize()
+    except Exception:
+        upload_date = pd.NaT
+
+    month_pattern = "|".join(MONTH_NUMBERS)
+    match = re.search(
+        rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(20\d{{2}}))?\b",
+        context,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        year = int(match.group(3)) if match.group(3) else (
+            int(upload_date.year) if pd.notna(upload_date) else datetime.now().year
+        )
+        month = MONTH_NUMBERS[match.group(1).lower()]
+        if pd.notna(upload_date) and not match.group(3) and month > upload_date.month + 1:
+            year -= 1
+        try:
+            event_date = pd.Timestamp(year=year, month=month, day=int(match.group(2)))
+            return event_date.date().isoformat(), match.group(0), "spoken_exact_date"
+        except ValueError:
+            pass
+
+    iso_match = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", context)
+    if iso_match:
+        try:
+            event_date = pd.Timestamp(iso_match.group(0))
+            return event_date.date().isoformat(), iso_match.group(0), "spoken_exact_date"
+        except ValueError:
+            pass
+
+    if pd.notna(upload_date) and re.search(r"\byesterday\b", context, flags=re.IGNORECASE):
+        return (upload_date - pd.Timedelta(days=1)).date().isoformat(), "yesterday", "spoken_relative_date"
+    if pd.notna(upload_date):
+        return upload_date.date().isoformat(), "", "video_upload_date"
+    return "", "", "missing_date"
 
 
 def build_context(
@@ -394,44 +577,85 @@ def extract_candidates(transcript_dir: Path) -> pd.DataFrame:
             matched = []
             for ticker, company, pats in patterns:
                 if any(p.search(text) for p in pats):
-                    matched.append((ticker, company))
+                    matched.append((ticker, company, pats))
 
             if not matched:
                 continue
 
             context, start, end = build_context(segments, i, window=2)
-            action, conf = infer_action(context)
             video_id = seg.get("video_id", "")
-            event_type = {
-                "buy_or_add": "buy_or_add",
-                "sell_or_reduce": "sell_or_reduce",
-                "hold_or_portfolio_holding": "holding_update",
-                "watchlist_or_uncertain": "watchlist",
-                "negative_or_not_buying": "negative_not_buying",
-            }.get(action, "mention_only")
+            quote_start = float(seg.get("start", start))
+            quote_end = float(seg.get("end", quote_start))
 
-            for ticker, company in matched:
+            for ticker, company, pats in matched:
+                local_quote = asset_local_context(text, pats, radius=160)
+                action, conf, evidence_class, strict_eligible = classify_action_evidence(local_quote)
+                local_context = local_quote
+                if evidence_class == "mention_only":
+                    adjacent_context = action_adjacent_context(context, local_quote)
+                    adjacent_result = classify_action_evidence(adjacent_context)
+                    if adjacent_result[2] != "mention_only":
+                        action, conf, evidence_class, strict_eligible = adjacent_result
+                        local_context = adjacent_context
+                event_date, event_date_text, date_source = infer_event_date(
+                    local_context,
+                    seg.get("video_date", ""),
+                )
+                if date_source == "video_upload_date" and re.search(
+                    r"\b(?:originally|that purchase|this purchase)\b",
+                    local_context,
+                    flags=re.IGNORECASE,
+                ):
+                    context_date = infer_event_date(context, seg.get("video_date", ""))
+                    if context_date[2] != "video_upload_date":
+                        event_date, event_date_text, date_source = context_date
+                historical_without_exact_date = (
+                    evidence_class == "personal_trade"
+                    and date_source == "video_upload_date"
+                    and re.search(
+                        r"\b(?:back in 20\d{2}|in 20\d{2}|years? ago|originally bought|used to buy|was buying)\b",
+                        local_context,
+                        flags=re.IGNORECASE,
+                    )
+                )
+                if historical_without_exact_date:
+                    evidence_class = "historical_personal_trade"
+                    strict_eligible = False
+                    conf = 0.88
+                event_type = {
+                    "buy_or_add": "buy_or_add",
+                    "sell_or_reduce": "sell_or_reduce",
+                    "hold_or_portfolio_holding": "holding_update",
+                    "watchlist_or_uncertain": "watchlist",
+                    "negative_or_not_buying": "negative_not_buying",
+                }.get(action, "mention_only")
                 rows.append(
                     {
                         "video_id": video_id,
                         "video_date": seg.get("video_date", ""),
+                        "event_date": event_date,
+                        "event_date_text": event_date_text,
+                        "date_source": date_source,
                         "video_title": seg.get("video_title", ""),
                         "video_url": seg.get("video_url", f"https://www.youtube.com/watch?v={video_id}"),
-                        "timestamp_seconds": int(start),
-                        "timestamp_start_seconds": int(start),
-                        "timestamp_end_seconds": int(end),
-                        "timestamp_start": seconds_to_hhmmss(start),
-                        "timestamp_end": seconds_to_hhmmss(end),
-                        "timestamp_url": f"https://www.youtube.com/watch?v={video_id}&t={int(start)}s",
+                        "timestamp_seconds": int(quote_start),
+                        "timestamp_start_seconds": int(quote_start),
+                        "timestamp_end_seconds": int(quote_end),
+                        "timestamp_start": seconds_to_hhmmss(quote_start),
+                        "timestamp_end": seconds_to_hhmmss(quote_end),
+                        "timestamp_url": f"https://www.youtube.com/watch?v={video_id}&t={int(quote_start)}s",
                         "ticker": ticker,
                         "company": company,
                         "action_inferred": action,
                         "event_type": event_type,
+                        "evidence_class": evidence_class,
+                        "strict_eligible": strict_eligible,
                         "confidence_rule_based": round(conf, 3),
                         "source_method": seg.get("source_method", "saved_transcript"),
                         "quote_segment": text,
+                        "asset_context": local_context,
                         "context_window": context,
-                        "manual_review": "yes" if conf < 0.75 or action in {"mention_only", "watchlist_or_uncertain", "negative_or_not_buying"} else "spot_check",
+                        "manual_review": "spot_check" if strict_eligible else "yes",
                         "verified_action": "",
                         "include_in_portfolio": "",
                         "notes": "",
@@ -445,7 +669,9 @@ def extract_candidates(transcript_dir: Path) -> pd.DataFrame:
     # De-duplicate overlapping repeated mentions of same ticker within the same minute/video.
     df["minute_bucket"] = (df["timestamp_start_seconds"] // 60).astype(int)
     df = df.sort_values(["video_date", "video_title", "timestamp_start_seconds", "ticker"])
-    df = df.drop_duplicates(subset=["video_url", "ticker", "minute_bucket", "action_inferred"])
+    df = df.drop_duplicates(
+        subset=["video_url", "ticker", "minute_bucket", "action_inferred", "event_date"]
+    )
     df = df.drop(columns=["minute_bucket"])
 
     return df
@@ -457,6 +683,9 @@ def make_review_template(df: pd.DataFrame) -> pd.DataFrame:
     keep = [
         "video_id",
         "video_date",
+        "event_date",
+        "event_date_text",
+        "date_source",
         "video_title",
         "timestamp_seconds",
         "timestamp_url",
@@ -464,9 +693,12 @@ def make_review_template(df: pd.DataFrame) -> pd.DataFrame:
         "company",
         "action_inferred",
         "event_type",
+        "evidence_class",
+        "strict_eligible",
         "confidence_rule_based",
         "source_method",
         "quote_segment",
+        "asset_context",
         "context_window",
         "manual_review",
         "verified_action",

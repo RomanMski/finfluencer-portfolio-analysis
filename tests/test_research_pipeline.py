@@ -51,6 +51,8 @@ class ResearchPipelineTests(unittest.TestCase):
 
         self.assertFalse(daily.empty)
         self.assertIn("event_portfolio_growth", daily.columns)
+        self.assertEqual(1.0, daily["event_portfolio_growth"].iloc[0])
+        self.assertEqual(0, daily["n_active"].iloc[0])
         self.assertEqual({"Event portfolio", "SPY", "QQQ"}, set(metrics["series"]))
         self.assertEqual(2, len(forward))
         self.assertIn("return_1m", forward.columns)

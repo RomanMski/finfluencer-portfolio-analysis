@@ -10,6 +10,8 @@ This is an academic research tool, not an investment model. Extracted events sho
 
 - strict Buy/Add, Sell/Reduce and Holding extraction
 - loose Watchlist and scenario fallback for less structured creators
+- evidence classes that separate personal trades, recommendations, holdings, planned entries, market movement and third-party actions
+- separate upload dates and spoken event dates when a creator names the transaction date
 - source fields for manual verification
 - separate saved runs for every creator
 - transcript, extraction and portfolio diagnostics
@@ -53,6 +55,16 @@ Run the local extraction tests:
 python -m unittest discover -s tests -v
 ```
 
+Build the small reproducible audit run from manually checked YouTube timestamp excerpts:
+
+```powershell
+python build_verified_audit_run.py --refresh-prices
+```
+
+The audit fixture covers Joseph Carlson, Financial Education and HKCM. It verifies
+that completed trades enter the strict portfolio while planned entry zones,
+historical anecdotes, market sell-offs and third-party trades do not.
+
 Run a live Joseph Carlson sanity check:
 
 ```powershell
@@ -69,6 +81,6 @@ Close the selected browser before using its cookies if the cookie database is lo
 
 ## Research warning
 
-The demo portfolio enters on the next trading day after an extracted Buy/Add event, holds for a fixed number of trading days, and equal-weights active positions. The final academic analysis should use manually verified rows and clearly documented portfolio rules.
+The demo portfolio enters at the next trading day's close after an eligible Buy/Add event. Returns begin on the following trading day, positions are held for a fixed number of trading days, and active positions are equal-weighted. The final academic analysis should use manually verified rows and clearly documented portfolio rules.
 
 Raw full transcripts and generated run folders are intentionally excluded from Git.
